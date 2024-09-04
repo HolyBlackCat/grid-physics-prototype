@@ -5,6 +5,8 @@
 #include "tile_grids/core.h"
 #include "utils/ring_multiarray.h"
 
+#include <minimacros/wrap_func.h>
+
 #include <bit>
 #include <cstdint>
 #include <cstdint>
@@ -37,11 +39,25 @@ namespace TileGrids
     //
     //     // Each tile of a chunk stores this.
     //     using CellType = ...;
-    //     // Returns true if the cell isn't empty, for the purposes of splitting unconnected grids. Default-constructed cells must count as empty.
-    //     [[nodiscard]] static bool CellIsNonEmpty(const CellType &cell);
-    //     // Returns the connectivity mask of a cell in the specified direction, for the purposes of splitting unconnected grids.
+    //
+    //     // Returns the connectivity mask of a cell in the specified direction, for a specific tile component, for the purposes of splitting unconnected grids.
     //     // The bit order should NOT be reversed when flipping direction, it's always the same.
-    //     [[nodiscard]] static TileEdgeConnectivity CellConnectivity(const CellType &cell, int dir);
+    //     // If your tile system doesn't support multi-component tiles (`TileComponentDesc == bool`), you can ignore the `comp` parameter.
+    //     [[nodiscard]] static TileEdgeConnectivity CellConnectivity(const CellType &cell, System::NonzeroTileComponentDesc comp, int dir);
+    //
+    //     // Does nothing if the cell is empty. If it's not empty, calls `func` at least once, which is `(System::NonzeroTileComponentDesc comp) -> void`.
+    //     // For tile systems that permit at most one component per tile (`System::TileComponentDesc == bool`), call `func` at most once with `{}` argument.
+    //     // Otherwise call it once per component. Bit masks of each component must not overlap.
+    //     static void ForEachCellComponent(const CellType &cell, auto &&func);
+    //
+    //     // [OPTIONAL] if the tile system doesn't support multi-component tiles.
+    //     // Given a direction, returns a cell component potentially touching that direction.
+    //     // We will also validate `CellConnectivity()` before calling this.
+    //     // static System::TileComponentDesc DiscoverCellComponent(const CellType &cell, int dir);
+    //
+    //     // [OPTIONAL] if the tile system doesn't support multi-component tiles.
+    //     // Moves `comp` tile component from `from` to `to`. The destination is guaranteed to have space for this component.
+    //     static void MoveCellComponent(NonzeroTileComponentDesc comp, CellType &from, CellType &to);
     //
     //     // Arbitrary user data that can be used to access different grids in the world.
     //     using WorldRef = ...;
@@ -147,7 +163,7 @@ namespace TileGrids
 
         // Returns the chunk, or null if out of bounds or just null.
         [[nodiscard]] auto GetChunk(this auto &&self, vec2<typename System::WholeChunkCoord> pos)
-            -> Meta::copy_cv_qualifiers<std::remove_reference_t<decltype(self)>, Chunk> *
+            -> Meta::copy_cv<decltype(self), Chunk> *
         {
             if (!self.chunks.bounds().contains(pos))
                 return nullptr;
@@ -442,8 +458,39 @@ namespace TileGrids
 
                 (*chunk)->components = {};
                 (*chunk)->chunk.ComputeConnectedComponents(
-                    reused, (*chunk)->components, &comps_per_tile, nullptr,
-                    &HighLevelTraits::CellIsNonEmpty, &HighLevelTraits::CellConnectivity
+                    reused,
+                    // Resulting component list.
+                    (*chunk)->components,
+                    // Tile to component map.
+                    &comps_per_tile,
+                    // On component done.
+                    nullptr,
+                    // For each cell component.
+                    [](const HighLevelTraits::CellType &cell, auto &&func){HighLevelTraits::ForEachCellComponent(cell, decltype(func)(func));},
+                    // Tile edge connectivity.
+                    &HighLevelTraits::CellConnectivity,
+                    // Discover cell component.
+                    [](const HighLevelTraits::CellType &cell, System::TileEdgeConnectivity conn, int dir) -> System::TileComponentDesc
+                    {
+                        // Not sure if this is optimal, but this makes the interface more convenient.
+                        typename System::TileComponentDesc comp;
+                        if constexpr (requires{HighLevelTraits::DiscoverCellComponent(cell, dir);})
+                        {
+                            comp = HighLevelTraits::DiscoverCellComponent(cell, dir);
+                        }
+                        else
+                        {
+                            static_assert(
+                                std::is_same_v<typename System::TileComponentDesc, bool>,
+                                "Must implement `HighLevelTraits::DiscoverCellComponent()` if this tile system supports multi-component tiles."
+                            );
+                            comp = true;
+                        }
+
+                        if (!(HighLevelTraits::CellConnectivity(cell, comp, dir) & conn))
+                            comp = {};
+                        return comp;
+                    }
                 );
 
                 // Run the user callback. Even if there's no components, just in case.
@@ -592,7 +639,13 @@ namespace TileGrids
                             coords.in_chunk_component,
                             new_chunk->components,
                             old_chunk->chunk,
-                            old_chunk->components
+                            old_chunk->components,
+                            []{
+                                if constexpr (requires(System::NonzeroTileComponentDesc c, HighLevelTraits::CellType &t){HighLevelTraits::MoveCellComponent(c, t, t);})
+                                    return M_FUNC(HighLevelTraits::MoveCellComponent);
+                                else
+                                    return nullptr;
+                            }()
                         );
 
                         // For each of the 4 chunk edges, if there's no chunk there yet, add this edge to our own little dirty list.

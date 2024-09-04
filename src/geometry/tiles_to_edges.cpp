@@ -40,7 +40,10 @@ namespace Geom::TilesToEdges
             std::vector<EdgeId> edges;
             edges.reserve(loops.size());
             for (const auto &loop : loops)
-                edges.push_back(vert_ids_to_edge_id.at({VertexId(loop.at(0)), VertexId(loop.at(1))}));
+            {
+                if (loop.size() >= 2)
+                    edges.push_back(vert_ids_to_edge_id.at({VertexId(loop.at(0)), VertexId(loop.at(1))}));
+            }
 
             tile_starting_edges.push_back(std::move(edges));
         }
@@ -102,7 +105,7 @@ namespace Geom::TilesToEdges
         per_tile_edge_info.resize(xvec2(vert_ids_to_edge_id.size(), input.tiles.size()));
         for (std::size_t i = 0; i < input.tiles.size(); i++)
         {
-            for (int loop_id = 0; const auto &loop : input.tiles[i])
+            for (int loop_index = 0; const auto &loop : input.tiles[i])
             {
                 for (std::size_t j = 0; j < loop.size(); j++)
                 {
@@ -119,10 +122,10 @@ namespace Geom::TilesToEdges
                     this_info.next = e2;
                     next_info.prev = e1;
 
-                    this_info.loop_id = loop_id;
+                    this_info.loop_index = loop_index;
                 }
 
-                loop_id++;
+                loop_index++;
             }
         }
     }

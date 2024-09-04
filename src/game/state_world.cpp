@@ -11,6 +11,7 @@
 #include "utils/json.h"
 #include "utils/ring_multiarray.h"
 #include "box2d_physics/math_adapters.h"
+#include "utils/bit_manip.h"
 
 #include <box2cpp/box2c.hpp>
 #include <box2cpp/debug_imgui_renderer.hpp>
@@ -29,6 +30,8 @@ struct PhysicsWorld : Tickable
         renderer.camera_pos.x = 12;
         renderer.camera_pos.y = 8;
         renderer.camera_scale = 28;
+
+        renderer.callbacks.drawMass = false;
     }
 
     void Tick() override
@@ -43,7 +46,14 @@ struct PhysicsWorld : Tickable
 
 namespace Tiles
 {
-    using System = TileGrids::System<TileGrids::DefaultSystemTraits>;
+    struct SystemTraits : TileGrids::DefaultSystemTraits
+    {
+        // Allow multi-component tiles. 4 bits per tile.
+        using TileComponentDesc = std::uint8_t;
+        static constexpr int num_tile_component_bits = 4;
+    };
+
+    struct System : TileGrids::System<SystemTraits> {};
 
     static constexpr int chunk_size = 8;
 
@@ -62,51 +72,74 @@ namespace Tiles
     // A chunk stores a grid of those.
     struct Cell
     {
-        Tile tile{};
-    };
+        Tile tiles[4]{};
 
-    // Those must be synced with `baked_tileset`.
-    enum class CellShape
-    {
-        empty,
-        full,
-        slope_a, // |/
-        slope_b, // \|
-        slope_c, // /|
-        slope_d, // |\ .
-        slope_ac, // |\ .
-    };
+        std::uint8_t bits{};
 
-    [[nodiscard]] static CellShape GetCellShape(const Cell &cell)
-    {
-        switch (cell.tile)
+        // Whether this tile connects to the one to right or below it.
+        [[nodiscard]] auto ConnectsToAdjacentTile(this auto &&self, bool vertical) -> BitManip::BitProperty<decltype(self), std::uint8_t, BitManip::any>
         {
-            case Tile::empty:        return CellShape::empty;
-            case Tile::wall:         return CellShape::full;
-            case Tile::wall_slope_a: return CellShape::slope_a;
-            case Tile::wall_slope_b: return CellShape::slope_b;
-            case Tile::wall_slope_c: return CellShape::slope_c;
-            case Tile::wall_slope_d: return CellShape::slope_d;
-            case Tile::wall_slope_ac: return CellShape::slope_ac;
-            case Tile::_count: break; // Should be unreachable.
+            return {self.bits, std::uint8_t(0b100 << vertical)};
         }
-        ASSERT(false, "Must specify shape for this cell.");
-        return CellShape::empty;
-    }
+        // Whether the internal quaters of this tile connect with each other.
+        // The index is: 0 - +X+Y, 1 = -X+Y, 2 = -X-Y, 3 = +X-Y.
+        [[nodiscard]] auto ConnectsInternally(this auto &&self, int i) -> BitManip::BitProperty<decltype(self), std::uint8_t, BitManip::any>
+        {
+            ASSERT(i >= 0 && i < 4);
+            return {self.bits, std::uint8_t(1 << i)};
+        }
+        // Same bits as in `ConnectsInternally()`, but all 4 in a single number.
+        [[nodiscard]] std::uint8_t ConnectsInternallyMask() const
+        {
+            return bits & 0b1111;
+        }
+
+        // Returns a bit mask of emptiness, consisting of 4 bits. (0th bit = +X quarter, 1th bit = +Y quarter, then -X, then -Y).
+        [[nodiscard]] std::uint8_t ComputeColliderNonEmptinessMask() const
+        {
+            return
+                (tiles[0] != Tile::empty) * 0b0001 |
+                (tiles[1] != Tile::empty) * 0b0010 |
+                (tiles[2] != Tile::empty) * 0b0100 |
+                (tiles[3] != Tile::empty) * 0b1000;
+        }
+
+        // Returns which bits in `bits` are allowed to be set with this `tiles[]` configuration.
+        // Note that bits 0 and 1 also require a matching adjacent tile in addition to being set in this mask.
+        [[nodiscard]] std::uint8_t ComputeAllowedBitsMask() const
+        {
+            std::uint8_t coll = ComputeColliderNonEmptinessMask();
+            std::uint8_t ret = coll & 0b11;
+
+            coll &= coll >> 1 | coll << 3;
+            ret |= coll << 2;
+            return ret;
+        }
+    };
 
     static Geom::TilesToEdges::BakedTileset baked_tileset = []{
         Geom::TilesToEdges::Tileset tileset;
-        tileset.tile_size = ivec2(1,1);
-        tileset.vertices = {ivec2(0,0), ivec2(1,0), ivec2(1,1), ivec2(0,1)};
+        tileset.tile_size = ivec2(2,2);
+        tileset.vertices = {ivec2(1,1), ivec2(0,0), ivec2(2,0), ivec2(2,2), ivec2(0,2)};
+        std::vector<unsigned int> sides[4] = {{0,2,3}, {0,3,4}, {0,4,1}, {0,1,2}};
         tileset.tiles = {
-            // Those must be synced with `CellShape`.
-            {},           // Empty.
-            {{0,1,2,3}},  // Box.
-            {{0,1,3}},    // |/
-            {{0,1,2}},    // \|
-            {{1,2,3}},    // /|
-            {{0,2,3}},    // |\ .
-            {{0,1,3}, {1,2,3}},    // |/ /|
+            // Padding those with `{}`s to have nice loop indices. After baking they disappear anyway.
+            {                                      },
+            {sides[0]                              },
+            {{},       sides[1]                    },
+            {sides[0], sides[1]                    },
+            {{},       {},       sides[2]          },
+            {sides[0], {},       sides[2]          },
+            {{},       sides[1], sides[2]          },
+            {sides[0], sides[1], sides[2]          },
+            {{},       {},       {},       sides[3]},
+            {sides[0], {},       {},       sides[3]},
+            {{},       sides[1], {},       sides[3]},
+            {sides[0], sides[1], {},       sides[3]},
+            {{},       {},       sides[2], sides[3]},
+            {sides[0], {},       sides[2], sides[3]},
+            {{},       sides[1], sides[2], sides[3]},
+            {sides[0], sides[1], sides[2], sides[3]},
         };
         return Geom::TilesToEdges::BakedTileset(std::move(tileset));
     }();
@@ -208,7 +241,7 @@ namespace Tiles
                 [&](ivec2 pos)
                 {
                     // The return values are indices into `baked_tileset`.
-                    return std::to_underlying(GetCellShape(chunk->GetChunk().at(pos)));
+                    return chunk->GetChunk().at(pos).ComputeColliderNonEmptinessMask();
                 },
                 // Point output.
                 [&](ivec2 pos, Geom::PointInfo info)
@@ -221,11 +254,16 @@ namespace Tiles
                         next_comp = System::ComponentIndex::invalid;
                     }
                 },
-                // Starting tile output for each edge loop.
-                [&](ivec2 pos, Geom::TilesToEdges::BakedTileset::EdgeId edge)
+                [&](ivec2 pos, int loop_index, ivec2 offset, int other_loop_index) -> bool
                 {
-                    (void)edge;
-                    System::ComponentIndex comp = comps_per_tile.at(pos);
+                    return
+                        comps_per_tile.at(System::CoordInsideChunkWithTileComp{.pos = pos, .comp = DiscoverCellComponent(chunk->GetChunk().at(pos), loop_index)}) ==
+                        comps_per_tile.at(System::CoordInsideChunkWithTileComp{.pos = pos + offset, .comp = DiscoverCellComponent(chunk->GetChunk().at(pos), other_loop_index)});
+                },
+                // Starting tile output for each edge loop.
+                [&](ivec2 pos, int loop_index)
+                {
+                    System::ComponentIndex comp = comps_per_tile.at(System::CoordInsideChunkWithTileComp(pos, std::uint8_t(1) << loop_index));
                     ASSERT(comp != System::ComponentIndex::invalid, "Why does an edge loop start from an empty cell?");
                     ASSERT(next_comp == System::ComponentIndex::invalid, "Too many 'edge loop begins' events?");
                     if (cur_comp == System::ComponentIndex::invalid)
@@ -257,7 +295,7 @@ namespace Tiles
                         else
                         {
                             assert(new_hull.count < b2_maxPolygonVertices);
-                            new_hull.points[new_hull.count++] = b2Vec2(fvec2(pos) + chunk_base_offset);
+                            new_hull.points[new_hull.count++] = b2Vec2(fvec2(pos) / baked_tileset.tile_size + chunk_base_offset);
                         }
                     }
                 );
@@ -281,28 +319,123 @@ namespace Tiles
 
         // Each tile of a chunk stores this.
         using CellType = Cell;
-        // Returns true if the cell isn't empty, for the purposes of splitting unconnected grids. Default-constructed cells must count as empty.
-        [[nodiscard]] static bool CellIsNonEmpty(const CellType &cell)
-        {
-            return cell.tile != Tile::empty;
-        }
+
         // Returns the connectivity mask of a cell in the specified direction, for the purposes of splitting unconnected grids.
         // The bit order should NOT be reversed when flipping direction, it's always the same.
-        [[nodiscard]] static System::TileEdgeConnectivity CellConnectivity(const CellType &cell, int dir)
+        [[nodiscard]] static System::TileEdgeConnectivity CellConnectivity(const CellType &cell, System::NonzeroTileComponentDesc comp, int dir)
         {
-            CellShape shape = GetCellShape(cell);
-            switch (shape)
+            ASSERT(dir >= 0 && dir < 4);
+
+            if (!(comp & 1 << dir))
+                return {}; // Not in this component.
+
+            // Respect connectivity bits for +X,+Y directions.
+            if (dir == 0 && !cell.ConnectsToAdjacentTile(0))
+                return {};
+            if (dir == 1 && !cell.ConnectsToAdjacentTile(1))
+                return {};
+
+            return cell.tiles[dir] == Tile::empty ? 1 : 0;
+        }
+
+        // Calls `func` for every component in the cell.
+        static void ForEachCellComponent(const CellType &cell, auto &&func)
+        {
+            std::uint8_t sides = cell.ComputeColliderNonEmptinessMask();
+            if (sides == 0)
+                return; // Not strictly necessary, hopefully an optimization.
+
+            std::uint8_t edges = cell.ConnectsInternallyMask();
+
+            // If `sides` ends with 1, move that block on ones 4 bits to the left.
+            // This ensures that all blocks of 1s are continuous.
+            std::uint8_t t = (std::uint8_t(1) << std::countr_one(sides)) - 1;
+            sides |= t << 4;
+            sides &= ~t;
+            // Duplicate edges 4 bits to the left, to match the extended `sides`.
+            edges |= edges << 4;
+
+            std::uint8_t comp = 0;
+            for (t = 1; sides || comp; t <<= 1)
             {
-                case CellShape::empty:   return 0;
-                case CellShape::full:    return 1;
-                case CellShape::slope_a: return std::array{0,0,1,1}[dir];
-                case CellShape::slope_b: return std::array{1,0,0,1}[dir];
-                case CellShape::slope_c: return std::array{1,1,0,0}[dir];
-                case CellShape::slope_d: return std::array{0,1,1,0}[dir];
-                case CellShape::slope_ac: return 1;
+                bool has_side = sides & t;
+                if (comp && (!has_side || !(edges & (t >> 1))))
+                {
+                    comp |= comp >> 4;
+                    comp &= 0b1111;
+                    func(std::as_const(comp));
+                    comp = 0;
+                }
+
+                if (has_side)
+                {
+                    sides &= ~t;
+                    comp |= t;
+                }
             }
-            ASSERT(false, "Invalid tile shape enum.");
-            return 0;
+        }
+
+        // Given a direction, returns a cell component touching that direction.
+        static System::TileComponentDesc DiscoverCellComponent(const CellType &cell, int dir)
+        {
+            ASSERT(dir >= 0 && dir < 4);
+
+            System::TileComponentDesc bit = System::TileComponentDesc(0b10001) << dir;
+
+            std::uint8_t sides = cell.ComputeColliderNonEmptinessMask();
+            if (!(sides & bit))
+                return {};
+
+            std::uint8_t edges = cell.ConnectsInternallyMask();
+
+            sides |= sides << 4;
+            edges |= edges << 4;
+
+            std::uint8_t comp = bit;
+
+            if ((sides & bit << 1) && (edges & bit))
+            {
+                comp |= bit << 1;
+
+                if ((sides & bit << 2) && (edges & bit << 1))
+                {
+                    comp |= bit << 2;
+
+                    if ((sides & bit << 3) && (edges & bit << 2))
+                        comp |= bit << 3;
+                }
+            }
+
+            if ((sides & bit >> 1) && (edges & bit >> 1))
+            {
+                comp |= bit >> 1;
+
+                if ((sides & bit >> 2) && (edges & bit >> 2))
+                {
+                    comp |= bit >> 2;
+
+                    if ((sides & bit >> 3) && (edges & bit >> 3))
+                        comp |= bit >> 3;
+                }
+            }
+
+            return comp & 0b1111;
+        }
+
+        // Moves parts of a cell listed in `comp` from `from` to `to`.
+        static void MoveCellComponent(System::NonzeroTileComponentDesc comp, CellType &from, CellType &to)
+        {
+            for (int i = 0; i < 4; i++)
+            {
+                if (comp & (1 << i))
+                {
+                    to.tiles[i] = from.tiles[i];
+                    from.tiles[i] = {};
+                }
+            }
+
+            from.bits &= from.ComputeAllowedBitsMask();
+            to.bits &= to.ComputeAllowedBitsMask();
         }
 
         // Returns our data from a grid.
@@ -345,7 +478,14 @@ namespace Tiles
                 int tile = tiles.at(pos);
                 if (tile < 0 || tile >= int(Tile::_count))
                     throw std::runtime_error(FMT("Unknown tile at {}", pos));
-                cell.tile = Tile(tile);
+                for (Tile &part : cell.tiles)
+                    part = Tile(tile);
+                cell.ConnectsInternally(0) = true;
+                cell.ConnectsInternally(1) = true;
+                cell.ConnectsInternally(2) = true;
+                cell.ConnectsInternally(3) = true;
+                cell.ConnectsToAdjacentTile(false) = true;
+                // cell.ConnectsToAdjacentTile(true) = true;
             }
         );
     }
@@ -363,7 +503,7 @@ struct TestEntity : Tickable, Renderable
 {
     IMP_STANDALONE_COMPONENT(Game)
 
-    int active_entity_index = -1;
+    int active_entity_index = -2;
 
     TestEntity()
     {

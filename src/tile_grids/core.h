@@ -20,7 +20,7 @@ namespace TileGrids
         // Tile coordinates across chunks.
         using GlobalTileCoord = int;
 
-        // Tile coordinates inside chunks.
+        // Tile coordinates inside chunks. Usually this will be in a `vec2<...>`.
         using CoordInsideChunk = int;
 
         // Coordinates of the whole chunks in a grid.
@@ -29,11 +29,22 @@ namespace TileGrids
         // Connectivity mask for an individual tile edge.
         using TileEdgeConnectivity = std::uint8_t;
 
+        // For tile systems that support >1 component per tile, this must be a mask type.
+        using TileComponentDesc = bool;
+        // The number of meaningful bits in `TileComponentDesc`.
+        // We'll call `std::countr_zero` on your mask (to disambiguate components in the same tile), so you shouldn't have unused bits.
+        static constexpr int num_tile_component_bits = 1;
+
         // For connectivity components inside individual chunks.
         using ComponentIndexUnderlyingType = std::uint16_t;
 
         // Uniquely represents a border edge of a chunk. 2 bits encode one of the 4 sides, the remaining bits encode the position.
         using BorderEdgeIndexUnderlyingType = std::uint16_t;
+    };
+
+    struct AlwaysTrueBool
+    {
+        [[nodiscard]] constexpr operator bool() const {return true;}
     };
 
     // This class can be templated one day, to support different underlying types.
@@ -52,8 +63,38 @@ namespace TileGrids
         using typename SystemTraits::CoordInsideChunk;
         using typename SystemTraits::WholeChunkCoord;
         using typename SystemTraits::TileEdgeConnectivity;
+        using typename SystemTraits::TileComponentDesc;
+        using SystemTraits::num_tile_component_bits;
 
-        struct Empty {};
+        // Normally matches `TileComponentDesc`, except that if it's `bool`, then this is `AlwaysTrueBool`, which is an empty struct.
+        using NonzeroTileComponentDesc = std::conditional_t<std::is_same_v<TileComponentDesc, bool>, AlwaysTrueBool, TileComponentDesc>;
+
+        static_assert(num_tile_component_bits >= 1);
+        static_assert((num_tile_component_bits == 1) == std::is_same_v<TileComponentDesc, bool>);
+
+        // This describes a position within chunk, and a component inside of that tile, if this tile system has mutli-component tiles.
+        struct CoordInsideChunkWithTileComp
+        {
+            vec2<CoordInsideChunk> pos;
+            [[no_unique_address]] NonzeroTileComponentDesc comp{};
+        };
+
+        // Returns an index for a tile component, uniquely disambiguating it among non-overlapping components in a tile.
+        // The result will always be less than `num_tile_component_bits`.
+        // `comp` shouldn't be null. Otherwise an assertion is triggered and an invalid index is returned.
+        [[nodiscard]] static constexpr int TileComponentToIndex(NonzeroTileComponentDesc comp)
+        {
+            if constexpr (std::is_same_v<TileComponentDesc, bool>)
+            {
+                return 0;
+            }
+            else
+            {
+                int ret = std::countr_zero(comp);
+                ASSERT(ret < num_tile_component_bits);
+                return ret;
+            }
+        }
 
         // Bakes 4-dir plus offset along a chunk border into a single integer.
         // The integers are sequental, so we can have an array of them.
@@ -94,23 +135,23 @@ namespace TileGrids
         // A list of tiles and the AABB of a single connectivity component in a chunk.
         class Component
         {
-            std::vector<vec2<CoordInsideChunk>> tiles;
+            std::vector<CoordInsideChunkWithTileComp> tiles;
             rect2<CoordInsideChunk> bounds;
 
           public:
             constexpr Component() {}
 
-            [[nodiscard]] const std::vector<vec2<CoordInsideChunk>> &GetTiles() const {return tiles;}
+            [[nodiscard]] const std::vector<CoordInsideChunkWithTileComp> &GetTiles() const {return tiles;}
             [[nodiscard]] rect2<CoordInsideChunk> GetBounds() const {return bounds;}
 
-            void AddTile(vec2<CoordInsideChunk> tile)
+            void AddTile(CoordInsideChunkWithTileComp tile)
             {
                 if (tiles.empty())
-                    bounds = tile.tiny_rect();
+                    bounds = tile.pos.tiny_rect();
                 else
-                    bounds = bounds.combine(tile);
+                    bounds = bounds.combine(tile.pos);
 
-                tiles.push_back(tile);
+                tiles.push_back(std::move(tile));
             }
         };
 
@@ -125,7 +166,7 @@ namespace TileGrids
         };
 
         // Information about a single connectivity component inside of a chunk.
-        template <typename ExtraData = Empty>
+        template <typename ExtraData = Meta::Empty>
         struct ComponentEntry
         {
             // The list of tiles.
@@ -144,6 +185,9 @@ namespace TileGrids
             // Which component this is, or `invalid` if none.
             ComponentIndex component_index = ComponentIndex::invalid;
 
+            // Which tile component touches this edge, if tiles have components.
+            [[no_unique_address]] NonzeroTileComponentDesc tile_component{};
+
             // Connectivity of this tile in this direction (regardless of what the opposing tile is).
             // If `component_index == invalid`, this is always zero.
             TileEdgeConnectivity conn_mask{};
@@ -151,7 +195,7 @@ namespace TileGrids
 
         // A list of connectivitiy components in a chunk, and the information about which of them touch which border edges.
         // `N` is the chunk size.
-        template <int N, typename PerComponentData = Empty>
+        template <int N, typename PerComponentData = Meta::Empty>
         struct ChunkComponents
         {
             static constexpr BorderEdgeIndex num_border_edge_indices = BorderEdgeIndex(N * 4);
@@ -262,8 +306,8 @@ namespace TileGrids
                 BorderEdgeInfo &edge_b = comps_b->border_edge_info[std::to_underlying(MakeBorderEdgeIndex(dir_in_b, i))];
                 if (bool(edge_a.conn_mask & edge_b.conn_mask))
                 {
-                    assert(edge_a.component_index != ComponentIndex::invalid);
-                    assert(edge_b.component_index != ComponentIndex::invalid);
+                    ASSERT(edge_a.component_index != ComponentIndex::invalid);
+                    ASSERT(edge_b.component_index != ComponentIndex::invalid);
 
                     if (reused.visited_pairs.insert({edge_a.component_index, edge_b.component_index}).second)
                     {
@@ -279,9 +323,9 @@ namespace TileGrids
         template <int N>
         struct ComputeConnectedComponentsReusedData
         {
-            std::array<std::array<bool, N>, N> visited{};
+            std::array<std::array<TileComponentDesc, N>, N> visited{};
 
-            std::array<vec2<CoordInsideChunk>, N * N> queue{};
+            std::array<CoordInsideChunkWithTileComp, N * N> queue{};
             std::size_t queue_pos = 0;
         };
 
@@ -289,23 +333,25 @@ namespace TileGrids
         template <int N>
         struct TileComponentIndices
         {
-            std::array<std::array<ComponentIndex, N>, N> array;
+            std::array<std::array<std::array<ComponentIndex, num_tile_component_bits>, N>, N> array{};
 
             constexpr TileComponentIndices()
             {
                 for (auto &row : array)
-                for (ComponentIndex &elem : row)
+                for (auto &cell : row)
+                for (ComponentIndex &elem : cell)
                     elem = ComponentIndex::invalid;
             }
 
-            [[nodiscard]] auto at(this auto &&self, vec2<CoordInsideChunk> pos) -> Meta::copy_cv_qualifiers<std::remove_reference_t<decltype(self)>, ComponentIndex> &
+            [[nodiscard]] auto at(this auto &&self, const CoordInsideChunkWithTileComp &coords)
+                -> Meta::copy_cv<decltype(self), ComponentIndex> &
             {
-                return self.array[pos.y][pos.x];
+                return self.array[coords.pos.y][coords.pos.x][TileComponentToIndex(coords.comp)];
             }
         };
 
         // A single chunk as a grid of `CellType` objects of size N*N.
-        template <int N, typename CellType, typename PerComponentData = Empty>
+        template <int N, typename CellType, typename PerComponentData = Meta::Empty>
         class Chunk
         {
           public:
@@ -319,17 +365,27 @@ namespace TileGrids
             static constexpr vec2<CoordInsideChunk> size = vec2<CoordInsideChunk>(N);
 
             // Access a cell.
-            [[nodiscard]] auto at(this auto &&self, vec2<CoordInsideChunk> pos) -> Meta::copy_cvref_qualifiers<decltype(self), CellType>
+            [[nodiscard]] auto at(this auto &&self, vec2<CoordInsideChunk> pos) -> Meta::copy_cvref<decltype(self), CellType>
             {
                 ASSERT(pos(all) >= CoordInsideChunk(0) && pos(all) < CoordInsideChunk(N), "Cell position in a chunk is out of bounds.");
-                return static_cast<Meta::copy_cvref_qualifiers<decltype(self), CellType>>(self.cells[pos.y][pos.x]);
+                return static_cast<Meta::copy_cvref<decltype(self), CellType>>(self.cells[pos.y][pos.x]);
             }
 
             // Moves a single connectivity component from the other chunk into this one.
             // The component itself remains the source vector (`other_comps.components`) to not mess up the indices,
             //   and must be erased from there later manually.
             // You can erase using `SwapWithLastAndRemoveComponent(index, true)`. Or manually, but then you must update `border_edge_info` mapping.
-            void MoveComponentFrom(ComponentIndex index, ComponentsType &self_comps, Chunk &other_chunk, ComponentsType &other_comps)
+            template <typename MoveTileComponentFunc = std::nullptr_t>
+            void MoveComponentFrom(
+                ComponentIndex index,
+                ComponentsType &self_comps,
+                Chunk &other_chunk,
+                ComponentsType &other_comps,
+                // `(NonzeroTileComponentDesc comp, CellType &from, CellType &to) -> void`.
+                // This is needed only for tile systems with multiple components per tile (`TileComponentDesc != bool`).
+                // Remove `comp` component from `from` and add it to `it`. It's guaranteed that `to` will have space for it.
+                MoveTileComponentFunc &&move_tile_component = nullptr
+            )
             {
                 ComponentEntry &other_comp = other_comps.components[std::to_underlying(index)];
                 ComponentIndex new_comp_index = ComponentIndex(self_comps.components.size());
@@ -347,12 +403,21 @@ namespace TileGrids
                 }
 
                 // Move the cells.
-                for (auto pos : new_comp.component.GetTiles())
+                for (const auto pos : new_comp.component.GetTiles())
                 {
-                    CellType &other_cell = other_chunk.at(pos);
-                    CellType &self_cell = at(pos);
-                    self_cell = std::move(other_cell);
-                    other_cell = {};
+                    CellType &other_cell = other_chunk.at(pos.pos);
+                    CellType &self_cell = at(pos.pos);
+
+                    if constexpr (std::is_null_pointer_v<MoveTileComponentFunc>)
+                    {
+                        static_assert(std::is_same_v<TileComponentDesc, bool>, "Must specify `move_tile_component()` if the tile system supports multi-component tiles.");
+                        self_cell = std::move(other_cell);
+                        other_cell = {};
+                    }
+                    else
+                    {
+                        move_tile_component(pos.comp, other_cell, self_cell);
+                    }
                 }
             }
 
@@ -373,11 +438,20 @@ namespace TileGrids
                 // If `out` is a `ComponentsType`, you don't have to do anything, as it can store multiple components.
                 //   But you CAN `.SwapWithLastAndRemoveComponent()` the newly added component, e.g. if you just separated it to a new entity.
                 auto &&component_done,
-                // `(const CellType &cell) -> bool`. Returns true if the tile exists, false if it's empty and can be ignored.
-                auto &&tile_exists,
-                // `(const CellType &cell, int dir) -> Chunk<...>::ComponentsType::TileEdgeConnectivity`.
-                // For a tile, returns its connectivity mask in one of the 4 directions.
-                auto &&tile_connectivity
+                // `(const CellType &cell, auto &&func) -> void`, where `func` is `(NonzeroTileComponentDesc comp) -> void`.
+                // Call `func({})` once if the cell is not empty, or do nothing otherwise.
+                // If your tile system has multi-component tiles (e.g. two triangle slopes side by side that are not attached),
+                //   you can call `func` more than once, with different arguments to describe the components.
+                auto &&for_each_tile_component,
+                // `(const CellType &cell, NonzeroTileComponentDesc comp, int dir) -> TileEdgeConnectivity`.
+                // For a tile (or rather its component), returns its connectivity mask in one of the 4 directions.
+                // Return 0 if there's no connectivity in that direction.
+                auto &&tile_connectivity,
+                // Optional if `TileComponentDesc == bool` (pass `nullptr`).
+                // `(const CellType &cell, TileEdgeConnectivity conn, int dir) -> TileComponentDesc`.
+                // Finds a component in `cell` at the specifified side and connectivity mask. Return zero if none.
+                // If `TileComponentDesc == bool` and this is `nullptr`, then this is implemented in terms of `tile_connectivity`.
+                auto &&discover_tile_component
             ) const
             {
                 static constexpr bool output_full_info = std::is_same_v<decltype(out), ComponentsType &>;
@@ -389,93 +463,103 @@ namespace TileGrids
 
                 for (const vec2<CoordInsideChunk> starting_pos : vector_range(vec2<CoordInsideChunk>(N)))
                 {
-                    if (reused.visited[starting_pos.y][starting_pos.x])
-                        continue; // Already visited.
-                    if (!tile_exists(at(starting_pos)))
-                        continue; // No tile here.
-
-                    // Only meaningful when `output_full_info == true`.
-                    ComponentIndex this_comp_index{};
-                    if constexpr (output_full_info)
-                        this_comp_index = ComponentIndex(out.components.size());
-
-                    // A reference to the target set of tiles.
-                    Component &out_comp = [&]() -> auto &
+                    for_each_tile_component(at(starting_pos), [&](const NonzeroTileComponentDesc &tile_comp)
                     {
+                        if (bool(reused.visited[starting_pos.y][starting_pos.x] & tile_comp))
+                            return; // Already visited.
+
+                        // Only meaningful when `output_full_info == true`.
+                        ComponentIndex this_comp_index{};
                         if constexpr (output_full_info)
+                            this_comp_index = ComponentIndex(out.components.size());
+
+                        // A reference to the target set of tiles.
+                        Component &out_comp = [&]() -> auto &
                         {
-                            return out.components.emplace_back().component;
-                        }
-                        else
-                        {
-                            out = {};
-                            return out;
-                        }
-                    }();
-
-                    // Only meaningful when `output_full_info == true`.
-                    std::vector<ComponentEdgeInfo> *out_border_edges = nullptr;
-                    if constexpr (output_full_info)
-                        out_border_edges = &out.components.back().border_edges;
-
-                    reused.queue_pos = 0;
-                    reused.queue[reused.queue_pos++] = starting_pos;
-                    reused.visited[starting_pos.y][starting_pos.x] = true;
-
-                    do
-                    {
-                        const vec2<CoordInsideChunk> pos = reused.queue[--reused.queue_pos];
-                        out_comp.AddTile(pos);
-                        if (out_comp_indices)
-                            (*out_comp_indices).at(pos) = this_comp_index;
-
-                        for (int i = 0; i < 4; i++)
-                        {
-                            // Whether it's the chunk border in this direction.
-                            bool is_chunk_edge =
-                                i == 0 ? pos.x == N - 1 :
-                                i == 1 ? pos.y == N - 1 :
-                                i == 2 ? pos.x == 0 :
-                                         pos.y == 0;
-
-                            const typename SystemTraits::TileEdgeConnectivity conn_mask = tile_connectivity(at(pos), std::as_const(i));
-
-                            // Dump information about a chunk edge, if this is one.
                             if constexpr (output_full_info)
                             {
-                                if (is_chunk_edge)
-                                {
-                                    const auto border_edge_index = MakeBorderEdgeIndex(i, pos[i % 2 == 0]);
-
-                                    out.border_edge_info[std::to_underlying(border_edge_index)] = {
-                                        .component_index = this_comp_index,
-                                        .conn_mask = conn_mask,
-                                    };
-
-                                    out_border_edges->push_back({
-                                        .edge_index = border_edge_index,
-                                        .conn_mask = conn_mask,
-                                    });
-                                }
+                                return out.components.emplace_back().component;
                             }
-
-                            // Add adjacent tiles to the queue.
-                            if (!is_chunk_edge && bool(conn_mask))
+                            else
                             {
-                                vec2<CoordInsideChunk> next_pos = pos + vec2<CoordInsideChunk>::dir4(i);
+                                out = {};
+                                return out;
+                            }
+                        }();
 
-                                if (!reused.visited[next_pos.y][next_pos.x] && tile_exists(at(next_pos)) && bool(conn_mask & tile_connectivity(at(next_pos), i ^ 2)))
+                        // Only meaningful when `output_full_info == true`.
+                        std::vector<ComponentEdgeInfo> *out_border_edges = nullptr;
+                        if constexpr (output_full_info)
+                            out_border_edges = &out.components.back().border_edges;
+
+                        reused.queue_pos = 0;
+                        reused.queue[reused.queue_pos++] = {.pos = starting_pos, .comp = tile_comp};
+                        reused.visited[starting_pos.y][starting_pos.x] |= tile_comp;
+
+                        do
+                        {
+                            const CoordInsideChunkWithTileComp pos_and_comp = reused.queue[--reused.queue_pos];
+                            out_comp.AddTile(pos_and_comp);
+                            if (out_comp_indices)
+                                (*out_comp_indices).at(pos_and_comp) = this_comp_index;
+
+                            for (int i = 0; i < 4; i++)
+                            {
+                                const TileEdgeConnectivity conn = tile_connectivity(at(pos_and_comp.pos), pos_and_comp.comp, std::as_const(i));
+                                if (!bool(conn))
+                                    continue; // This edge has no connectivity.
+
+                                // Whether it's the chunk border in this direction.
+                                bool is_chunk_edge =
+                                    i == 0 ? pos_and_comp.pos.x == N - 1 :
+                                    i == 1 ? pos_and_comp.pos.y == N - 1 :
+                                    i == 2 ? pos_and_comp.pos.x == 0 :
+                                             pos_and_comp.pos.y == 0;
+
+                                // Dump information about a chunk edge, if this is one.
+                                if constexpr (output_full_info)
                                 {
-                                    reused.visited[next_pos.y][next_pos.x] = true;
-                                    reused.queue[reused.queue_pos++] = next_pos;
+                                    if (is_chunk_edge)
+                                    {
+                                        const auto border_edge_index = MakeBorderEdgeIndex(i, pos_and_comp.pos[i % 2 == 0]);
+
+                                        out.border_edge_info[std::to_underlying(border_edge_index)] = {
+                                            .component_index = this_comp_index,
+                                            .tile_component = pos_and_comp.comp,
+                                            .conn_mask = conn,
+                                        };
+
+                                        out_border_edges->push_back({
+                                            .edge_index = border_edge_index,
+                                            .conn_mask = conn,
+                                        });
+                                    }
+                                }
+
+                                // Add adjacent tiles to the queue.
+                                if (!is_chunk_edge)
+                                {
+                                    const vec2<CoordInsideChunk> next_pos = pos_and_comp.pos + vec2<CoordInsideChunk>::dir4(i);
+
+                                    TileComponentDesc next_comp{};
+                                    if constexpr (std::is_same_v<TileComponentDesc, bool> && std::is_null_pointer_v<decltype(discover_tile_component)>)
+                                        next_comp = tile_connectivity(at(next_pos), AlwaysTrueBool{}, (i + 2) % 4);
+                                    else
+                                        next_comp = discover_tile_component(at(next_pos), conn, (i + 2) % 4);
+
+                                    if (next_comp && (next_comp & reused.visited[next_pos.y][next_pos.x]) == TileComponentDesc{})
+                                    {
+                                        reused.visited[next_pos.y][next_pos.x] |= next_comp;
+                                        reused.queue[reused.queue_pos++] = {.pos = next_pos, .comp = next_comp};
+                                    }
                                 }
                             }
                         }
-                    }
-                    while (reused.queue_pos > 0);
+                        while (reused.queue_pos > 0);
 
-                    if constexpr (!std::is_null_pointer_v<std::remove_cvref_t<decltype(component_done)>>)
-                        component_done();
+                        if constexpr (!std::is_null_pointer_v<std::remove_cvref_t<decltype(component_done)>>)
+                            component_done();
+                    });
                 }
             }
         };

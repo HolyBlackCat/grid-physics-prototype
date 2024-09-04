@@ -66,7 +66,7 @@ namespace TileGrids
                     {
                         for (const auto &coord : comp.component.GetTiles())
                         {
-                            fvec2 center = base_pos + coord + 0.5f;
+                            fvec2 center = base_pos + coord.pos + 0.5f;
                             std::string text = FMT("{}", comp_index);
                             list.AddText(ImVec2(local_to_screen_coords(center) - fvec2(ImGui::CalcTextSize(text.c_str())) / 2), ImColor(1.f,0.f,0.f,1.f), text.c_str());
                         }
@@ -142,7 +142,7 @@ namespace TileGrids
                     const auto &tiles = grid.GetChunkComponents(coords.chunk_coord)->components.at(std::to_underlying(coords.in_chunk_component)).component.GetTiles();
                     fvec2 pos;
                     for (auto coord : tiles)
-                        pos += fvec2(coord);
+                        pos += fvec2(coord.pos);
                     pos /= tiles.size();
                     pos += coords.chunk_coord * N;
                     pos += 0.5f;

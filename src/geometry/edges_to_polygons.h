@@ -2,6 +2,7 @@
 
 #include "geometry/common.h"
 #include "geometry/simplify_straight_edges.h"
+#include "program/errors.h"
 #include "utils/sparse_set.h"
 
 #include <CDT/CDT.h> // For the constructor of Topology that fills it from a triangulation.
@@ -34,7 +35,7 @@ Geom::EdgesToPolygons::ConvertToPolygons<float>(tri_input, b2_maxPolygonVertices
     }
     else
     {
-        assert(hull.count < b2_maxPolygonVertices);
+        ASSERT(hull.count < b2_maxPolygonVertices);
         hull.points[hull.count++] = b2Vec2(fvec2(pos));
     }
 });
@@ -118,8 +119,8 @@ namespace Geom::EdgesToPolygons
                 deduplicate_points
             ](vec2<T> pos, PointInfo info, bool convex) mutable
             {
-                assert(info.closed && "The input contours must be closed.");
-                assert((info.type == PointType::normal || info.type == PointType::last) && "Weird point type.");
+                ASSERT(info.closed, "The input contours must be closed.");
+                ASSERT((info.type == PointType::normal || info.type == PointType::last), "Weird point type.");
 
                 bool is_first = first_vertex == VertexId::invalid;
                 bool is_last = info.type == PointType::last;
@@ -242,7 +243,7 @@ namespace Geom::EdgesToPolygons
         template <typename T>
         Topology(const CDT::Triangulation<T> &input)
         {
-            assert(input.triangles.size() > 0); // Not strictly necessary?
+            ASSERT(input.triangles.size() > 0); // Not strictly necessary?
             if (input.triangles.empty())
                 return;
 
@@ -295,7 +296,7 @@ namespace Geom::EdgesToPolygons
 
                             k++;
                         }
-                        assert(k != 3 && "Neighbor roundtrip failed.");
+                        ASSERT(k != 3, "Neighbor roundtrip failed.");
                     }
                 }
             }
@@ -380,7 +381,7 @@ namespace Geom::EdgesToPolygons
                     if (ca == 0)
                     {
                         Edge &e = GetMutEdge(neighbor_edge.next);
-                        assert(!e.origin_vert_is_flat);
+                        ASSERT(!e.origin_vert_is_flat);
                         if (!e.origin_vert_is_flat)
                         {
                             e.origin_vert_is_flat = true;
@@ -390,7 +391,7 @@ namespace Geom::EdgesToPolygons
                     if (cb == 0)
                     {
                         Edge &e = GetMutEdge(edge.next);
-                        assert(!e.origin_vert_is_flat);
+                        ASSERT(!e.origin_vert_is_flat);
                         if (!e.origin_vert_is_flat)
                         {
                             e.origin_vert_is_flat = true;
@@ -448,14 +449,14 @@ namespace Geom::EdgesToPolygons
 
         [[nodiscard]] Edge &GetMutEdge(EdgeId id)
         {
-            assert(id != EdgeId::invalid);
-            assert(std::to_underlying(id) < edges.size());
+            ASSERT(id != EdgeId::invalid);
+            ASSERT(std::to_underlying(id) < edges.size());
             return edges[std::to_underlying(id)];
         }
         [[nodiscard]] Face &GetMutFace(FaceId id)
         {
-            assert(id != FaceId::invalid);
-            assert(std::to_underlying(id) < faces.size());
+            ASSERT(id != FaceId::invalid);
+            ASSERT(std::to_underlying(id) < faces.size());
             return faces[std::to_underlying(id)];
         }
 
@@ -465,10 +466,10 @@ namespace Geom::EdgesToPolygons
         void CollapseEdge(EdgeId edge_id)
         {
             Edge &edge = GetMutEdge(edge_id);
-            assert(edge.face != FaceId::invalid);
+            ASSERT(edge.face != FaceId::invalid);
             EdgeId neighbor_edge_id = edge.neighbor;
             Edge &neighbor_edge = GetMutEdge(neighbor_edge_id);
-            assert(neighbor_edge.face != FaceId::invalid);
+            ASSERT(neighbor_edge.face != FaceId::invalid);
 
             FaceId kept_face_id = edge.face;
             FaceId destroyed_face_id = neighbor_edge.face;
@@ -480,7 +481,7 @@ namespace Geom::EdgesToPolygons
                 Edge *cur = &neighbor_edge;
                 do
                 {
-                    assert(cur->face == destroyed_face_id);
+                    ASSERT(cur->face == destroyed_face_id);
                     cur->face = kept_face_id;
                     cur = &GetMutEdge(cur->next);
                 }
@@ -533,13 +534,13 @@ namespace Geom::EdgesToPolygons
 
             Topology topo(tr);
 
-            assert(topo.face_set.Capacity() == 2);
-            assert(topo.face_set.ElemCount() == 2);
-            assert((topo.faces == std::vector{
+            ASSERT(topo.face_set.Capacity() == 2);
+            ASSERT(topo.face_set.ElemCount() == 2);
+            ASSERT((topo.faces == std::vector{
                 Face{ .any_edge = EdgeId(2) },
                 Face{ .any_edge = EdgeId(5) },
             }));
-            assert((topo.edges == std::vector{
+            ASSERT((topo.edges == std::vector{
                 /*0*/ Edge{ .origin_vert = VertexId(3), .neighbor = EdgeId(3),       .prev = EdgeId(2), .next = EdgeId(1), .face = FaceId(0) },
                 /*1*/ Edge{ .origin_vert = VertexId(1), .neighbor = EdgeId::invalid, .prev = EdgeId(0), .next = EdgeId(2), .face = FaceId(0) },
                 /*2*/ Edge{ .origin_vert = VertexId(2), .neighbor = EdgeId::invalid, .prev = EdgeId(1), .next = EdgeId(0), .face = FaceId(0) },
