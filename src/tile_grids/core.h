@@ -343,10 +343,31 @@ namespace TileGrids
                     elem = ComponentIndex::invalid;
             }
 
-            [[nodiscard]] auto at(this auto &&self, const CoordInsideChunkWithTileComp &coords)
-                -> Meta::copy_cv<decltype(self), ComponentIndex> &
+            void Set(const CoordInsideChunkWithTileComp &coord, ComponentIndex comp)
             {
-                return self.array[coords.pos.y][coords.pos.x][TileComponentToIndex(coords.comp)];
+                auto &target = array[coord.pos.y][coord.pos.x];
+                if constexpr (std::is_same_v<TileComponentDesc, bool>)
+                {
+                    target[0] = comp;
+                }
+                else
+                {
+                    for (int i = 0; i < num_tile_component_bits; i++)
+                    {
+                        if (coord.comp & (TileComponentDesc(1) << i))
+                            target[i] = comp;
+                    }
+                }
+            }
+
+            [[nodiscard]] ComponentIndex GetByIndex(vec2<CoordInsideChunk> pos, int index) const
+            {
+                return array[pos.y][pos.x][index];
+            }
+
+            [[nodiscard]] ComponentIndex GetByComponent(vec2<CoordInsideChunk> pos, NonzeroTileComponentDesc comp) const
+            {
+                return GetByIndex(pos, TileComponentToIndex(comp));
             }
         };
 
@@ -501,7 +522,7 @@ namespace TileGrids
                             const CoordInsideChunkWithTileComp pos_and_comp = reused.queue[--reused.queue_pos];
                             out_comp.AddTile(pos_and_comp);
                             if (out_comp_indices)
-                                (*out_comp_indices).at(pos_and_comp) = this_comp_index;
+                                out_comp_indices->Set(pos_and_comp, this_comp_index);
 
                             for (int i = 0; i < 4; i++)
                             {

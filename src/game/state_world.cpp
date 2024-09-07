@@ -74,12 +74,14 @@ namespace Tiles
     {
         Tile tiles[4]{};
 
+        // Lower 4 bits are interal connectivity (see `ConnectsInternally()`).
+        // Next 2 bits are external connectivity: +X and +Y.
         std::uint8_t bits{};
 
         // Whether this tile connects to the one to right or below it.
         [[nodiscard]] auto ConnectsToAdjacentTile(this auto &&self, bool vertical) -> BitManip::BitProperty<decltype(self), std::uint8_t, BitManip::any>
         {
-            return {self.bits, std::uint8_t(0b100 << vertical)};
+            return {self.bits, std::uint8_t(0b10000 << vertical)};
         }
         // Whether the internal quaters of this tile connect with each other.
         // The index is: 0 - +X+Y, 1 = -X+Y, 2 = -X-Y, 3 = +X-Y.
@@ -109,10 +111,10 @@ namespace Tiles
         [[nodiscard]] std::uint8_t ComputeAllowedBitsMask() const
         {
             std::uint8_t coll = ComputeColliderNonEmptinessMask();
-            std::uint8_t ret = coll & 0b11;
+            std::uint8_t ret = (coll & 0b11) << 4;
 
             coll &= coll >> 1 | coll << 3;
-            ret |= coll << 2;
+            ret |= coll;
             return ret;
         }
     };
@@ -256,14 +258,12 @@ namespace Tiles
                 },
                 [&](ivec2 pos, int loop_index, ivec2 offset, int other_loop_index) -> bool
                 {
-                    return
-                        comps_per_tile.at(System::CoordInsideChunkWithTileComp{.pos = pos, .comp = DiscoverCellComponent(chunk->GetChunk().at(pos), loop_index)}) ==
-                        comps_per_tile.at(System::CoordInsideChunkWithTileComp{.pos = pos + offset, .comp = DiscoverCellComponent(chunk->GetChunk().at(pos), other_loop_index)});
+                    return comps_per_tile.GetByIndex(pos, loop_index) == comps_per_tile.GetByIndex(pos + offset, other_loop_index);
                 },
                 // Starting tile output for each edge loop.
                 [&](ivec2 pos, int loop_index)
                 {
-                    System::ComponentIndex comp = comps_per_tile.at(System::CoordInsideChunkWithTileComp(pos, std::uint8_t(1) << loop_index));
+                    System::ComponentIndex comp = comps_per_tile.GetByIndex(pos, loop_index);
                     ASSERT(comp != System::ComponentIndex::invalid, "Why does an edge loop start from an empty cell?");
                     ASSERT(next_comp == System::ComponentIndex::invalid, "Too many 'edge loop begins' events?");
                     if (cur_comp == System::ComponentIndex::invalid)
@@ -335,7 +335,7 @@ namespace Tiles
             if (dir == 1 && !cell.ConnectsToAdjacentTile(1))
                 return {};
 
-            return cell.tiles[dir] == Tile::empty ? 1 : 0;
+            return cell.tiles[dir] == Tile::empty ? 0 : 1;
         }
 
         // Calls `func` for every component in the cell.
@@ -481,11 +481,11 @@ namespace Tiles
                 for (Tile &part : cell.tiles)
                     part = Tile(tile);
                 cell.ConnectsInternally(0) = true;
-                cell.ConnectsInternally(1) = true;
+                // cell.ConnectsInternally(1) = true;
                 cell.ConnectsInternally(2) = true;
-                cell.ConnectsInternally(3) = true;
+                // cell.ConnectsInternally(3) = true;
                 cell.ConnectsToAdjacentTile(false) = true;
-                // cell.ConnectsToAdjacentTile(true) = true;
+                cell.ConnectsToAdjacentTile(true) = true;
             }
         );
     }
