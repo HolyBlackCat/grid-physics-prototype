@@ -26,7 +26,7 @@ struct PhysicsWorld : Tickable
 
     PhysicsWorld()
     {
-        w = adjust(b2::World::Params{}, .gravity.y *= -1);
+        w = adjust(b2::World::Params{}, .gravity.y = 10);
         renderer.camera_pos.x = 12;
         renderer.camera_pos.y = 8;
         renderer.camera_scale = 28;
@@ -36,12 +36,22 @@ struct PhysicsWorld : Tickable
 
     void Tick() override
     {
-        w.Step(1/60.f, 4);
+        int n = 1;
+        for (int i = 0; i < n; i++)
+            w.Step(1/60.f / n, 4);
 
         renderer.DrawShapes(w);
         renderer.DrawModeToggles();
         renderer.MouseDrag(w);
     }
+};
+
+enum class PhysicsMaskBits : std::uint64_t
+{
+    wall = 1 << 0, // Solid walls.
+
+    query = 1 << 1, // Queries use this as the `categoryBits`. Non-collidable bodies set this as the `maskBits`.
+    chunkContentBounds = 1 << 2, // Doesn't collide with anything, used to find chunks, e.g. for rendering.
 };
 
 namespace Tiles
@@ -56,6 +66,10 @@ namespace Tiles
     struct System : TileGrids::System<SystemTraits> {};
 
     static constexpr int chunk_size = 8;
+
+    // Each tile has this size in box2d coordinates.
+    // Probably should be set to 1 in real
+    static constexpr float physics_tile_size_multiplier = 0.4f;
 
     enum class Tile
     {
@@ -146,7 +160,12 @@ namespace Tiles
         return Geom::TilesToEdges::BakedTileset(std::move(tileset));
     }();
 
-    struct ChunkComponentCollider
+    struct ChunkData
+    {
+        b2::Shape content_bounds;
+    };
+
+    struct ChunkComponentData
     {
         struct Polygon
         {
@@ -157,12 +176,20 @@ namespace Tiles
         std::vector<Polygon> polygons;
     };
 
+    struct TileCoordAndFrac
+    {
+        vec2<System::GlobalTileCoord> tile;
+        fvec2 frac; // Fractional coord inside of the tile.
+    };
+
+    using ChunkGrid = TileGrids::ChunkGrid<System, chunk_size, Cell, ChunkData, ChunkComponentData>;
+
     // The entity for tile grids.
     struct GridEntity : Meta::with_virtual_destructor<GridEntity>
     {
         IMP_STANDALONE_COMPONENT(Game)
 
-        TileGrids::ChunkGrid<System, chunk_size, Cell, ChunkComponentCollider> grid;
+        ChunkGrid grid;
         b2::Body body;
 
         GridEntity(PhysicsWorld &w, fvec2 pos, float angle)
@@ -177,11 +204,38 @@ namespace Tiles
         }
 
         void LoadTiles(Stream::ReadOnlyData data);
+
+        [[nodiscard]] fvec2 GridPointToWorld(fvec2 pos) const {return fvec2(body.GetWorldPoint(pos * physics_tile_size_multiplier));}
+        [[nodiscard]] fvec2 GridDirToWorld(fvec2 pos) const {return fvec2(body.GetWorldVector(pos * physics_tile_size_multiplier));}
+        [[nodiscard]] fvec2 WorldPointToGrid(fvec2 pos) const {return fvec2(body.GetLocalPoint(pos)) / physics_tile_size_multiplier;}
+        [[nodiscard]] fvec2 WorldDirToGrid(fvec2 pos) const {return fvec2(body.GetLocalVector(pos)) / physics_tile_size_multiplier;}
+
+        [[nodiscard]] vec2<System::GlobalTileCoord> LocalPointToTile(fvec2 pos) const {return ivec2(floor(pos));}
+
+        [[nodiscard]] TileCoordAndFrac LocalPointToTileAndFrac(fvec2 pos) const {TileCoordAndFrac ret; ret.tile = LocalPointToTile(pos); ret.frac = pos - ret.tile; return ret;}
     };
 
-    [[nodiscard]] b2::Shape::Params GetShapeParams()
+    [[nodiscard]] const b2::Shape::Params &GetShapeParamsWall()
     {
-        return {};
+        static const b2::Shape::Params ret = []{
+            b2::Shape::Params ret;
+            ret.filter.categoryBits = std::to_underlying(PhysicsMaskBits::wall);
+            ret.filter.maskBits = std::to_underlying(PhysicsMaskBits::wall);
+            return ret;
+        }();
+        return ret;
+    }
+
+    [[nodiscard]] const b2::Shape::Params &GetShapeParamsChunkContentBounds()
+    {
+        static const b2::Shape::Params ret = []{
+            b2::Shape::Params ret;
+            ret.density = 0;
+            ret.filter.categoryBits = std::to_underlying(PhysicsMaskBits::chunkContentBounds);
+            ret.filter.maskBits = std::to_underlying(PhysicsMaskBits::query);
+            return ret;
+        }();
+        return ret;
     }
 
     // Traits class for `tile_grids/high_level.h`. We wrap it in `EntityHighLevelTraits` below instead of using directly.
@@ -208,15 +262,9 @@ namespace Tiles
 
         // This part is directly for `tile_grids/high_level.h`:
 
-        static void OnUpdateGridChunkContents(EntityTag::Controller& controller, GridEntity *grid, vec2<System::WholeChunkCoord> chunk_coord, const System::TileComponentIndices<chunk_size> &comps_per_tile)
+        static void OnUpdateGridChunkComponents(EntityTag::Controller& controller, GridEntity *grid, vec2<System::WholeChunkCoord> chunk_coord, const System::TileComponentIndices<chunk_size> &comps_per_tile)
         {
             (void)controller;
-
-            static b2::Shape::Params shape_params = GetShapeParams();
-
-            fvec2 chunk_base_offset = fvec2(chunk_coord) * chunk_size;
-
-            auto *chunk = grid->grid.GetChunk(chunk_coord);
 
             struct CompEntry
             {
@@ -230,6 +278,8 @@ namespace Tiles
                 CompEntry(const CompEntry &) = delete;
                 CompEntry &operator=(const CompEntry &) = delete;
             };
+
+            auto *chunk = grid->grid.GetChunk(chunk_coord);
 
             // One triangulation input per component.
             std::vector<CompEntry> tri_inputs(chunk->GetComponents().components.size());
@@ -256,6 +306,7 @@ namespace Tiles
                         next_comp = System::ComponentIndex::invalid;
                     }
                 },
+                // Is connected?
                 [&](ivec2 pos, int loop_index, ivec2 offset, int other_loop_index) -> bool
                 {
                     return comps_per_tile.GetByIndex(pos, loop_index) == comps_per_tile.GetByIndex(pos + offset, other_loop_index);
@@ -273,9 +324,12 @@ namespace Tiles
                 }
             );
 
+            static b2::Shape::Params shape_params = GetShapeParamsWall();
+            fvec2 chunk_base_offset = fvec2(chunk_coord) * chunk_size * physics_tile_size_multiplier;
+
             for (std::size_t i = 0; i < chunk->GetComponents().components.size(); i++)
             {
-                ChunkComponentCollider &coll = chunk->GetMutComponentExtraData(System::ComponentIndex(i));
+                ChunkComponentData &coll = chunk->GetMutComponentUserData(System::ComponentIndex(i));
                 coll.polygons.clear(); // This destroys the existing shapes too.
 
                 b2Hull new_hull{};
@@ -286,7 +340,7 @@ namespace Tiles
                     {
                         if (info.type == Geom::PointType::last)
                         {
-                            ChunkComponentCollider::Polygon &new_poly = coll.polygons.emplace_back();
+                            ChunkComponentData::Polygon &new_poly = coll.polygons.emplace_back();
                             new_poly.shape_data = b2MakePolygon(&new_hull, 0);
 
                             new_poly.shape = grid->body.CreateShape(b2::OwningHandle, shape_params, b2MakePolygon(&new_hull, 0));
@@ -295,7 +349,7 @@ namespace Tiles
                         else
                         {
                             assert(new_hull.count < b2_maxPolygonVertices);
-                            new_hull.points[new_hull.count++] = b2Vec2(fvec2(pos) / baked_tileset.tile_size + chunk_base_offset);
+                            new_hull.points[new_hull.count++] = b2Vec2(fvec2(pos) / baked_tileset.tile_size * physics_tile_size_multiplier + chunk_base_offset);
                         }
                     }
                 );
@@ -305,16 +359,53 @@ namespace Tiles
         static void OnPreMoveComponentBetweenChunks(typename EntityTag::Controller& controller, GridEntity *source_grid, System::ComponentCoords coords, GridEntity *target_grid)
         {
             (void)controller;
-            ChunkComponentCollider &source_collider = source_grid->grid.GetChunk(coords.chunk_coord)->GetMutComponentExtraData(coords.in_chunk_component);
-            b2::Shape::Params params = GetShapeParams();
-            for (ChunkComponentCollider::Polygon &polygon : source_collider.polygons)
+
+            // Recreate the shapes in the correct body.
+            ChunkComponentData &source_collider = source_grid->grid.GetChunk(coords.chunk_coord)->GetMutComponentUserData(coords.in_chunk_component);
+            b2::Shape::Params params = GetShapeParamsWall();
+            for (ChunkComponentData::Polygon &polygon : source_collider.polygons)
                 polygon.shape = target_grid->body.CreateShape(b2::OwningHandle, params, polygon.shape_data);
+        }
+
+        static void OnPostMoveComponentBetweenChunks(typename EntityTag::Controller& controller, GridEntity *source_grid, System::ComponentCoords coords, GridEntity *target_grid)
+        {
+            (void)controller;
+            (void)source_grid;
+            (void)coords;
+            (void)target_grid;
         }
 
         static void FinalizeGridAfterChange(typename EntityTag::Controller& controller, GridEntity *grid)
         {
             (void)controller;
             grid->body.ApplyMassFromShapes();
+        }
+
+        static void FinalizeChunkAfterSplitRemovingComponents(typename EntityTag::Controller& controller, GridEntity *grid, vec2<System::WholeChunkCoord> chunk_coord)
+        {
+            (void)controller;
+            (void)grid;
+            (void)chunk_coord;
+        }
+
+        static void FinalizeChunkAfterChange(typename EntityTag::Controller& controller, GridEntity *grid, vec2<System::WholeChunkCoord> chunk_coord)
+        {
+            (void)controller;
+
+            auto *chunk = grid->grid.GetChunk(chunk_coord);
+
+
+            // Update the content bounds collider.
+            ASSERT(!chunk->GetComponents().components.empty());
+            fvec2 chunk_base_offset = fvec2(chunk_coord) * chunk_size * physics_tile_size_multiplier;
+
+            frect2 rect = chunk_base_offset + chunk->GetContentBounds() * physics_tile_size_multiplier;
+            b2Hull hull;
+            hull.count = 0;
+            for (fvec2 corner : rect.to_contour())
+                hull.points[hull.count++] = corner;
+
+            chunk->GetUserData().content_bounds = grid->body.CreateShape(b2::OwningHandle, GetShapeParamsChunkContentBounds(), b2MakePolygon(&hull, 0));
         }
 
         // Each tile of a chunk stores this.
@@ -439,7 +530,7 @@ namespace Tiles
         }
 
         // Returns our data from a grid.
-        [[nodiscard]] static TileGrids::ChunkGrid<System, chunk_size, CellType, ChunkComponentCollider> &GridToData(GridEntity *grid)
+        [[nodiscard]] static ChunkGrid &GridToData(GridEntity *grid)
         {
             return grid->grid;
         }
@@ -481,9 +572,9 @@ namespace Tiles
                 for (Tile &part : cell.tiles)
                     part = Tile(tile);
                 cell.ConnectsInternally(0) = true;
-                // cell.ConnectsInternally(1) = true;
+                cell.ConnectsInternally(1) = true;
                 cell.ConnectsInternally(2) = true;
-                // cell.ConnectsInternally(3) = true;
+                cell.ConnectsInternally(3) = true;
                 cell.ConnectsToAdjacentTile(false) = true;
                 cell.ConnectsToAdjacentTile(true) = true;
             }

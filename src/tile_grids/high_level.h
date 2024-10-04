@@ -1,6 +1,7 @@
 #pragma once
 
 #include "macros/enum_flag_operators.h"
+#include "meta/common.h"
 #include "program/errors.h"
 #include "tile_grids/core.h"
 #include "utils/ring_multiarray.h"
@@ -83,19 +84,29 @@ namespace TileGrids
     //
     //     // This is called after updating chunk contents (when handling the `geometry_changed` flag).
     //     // `comps_per_tile` is the mapping between tile coordinates to component indices.
-    //     static void OnUpdateGridChunkContents(WorldRef world, GridRef grid, vec2<typename System::WholeChunkCoord> chunk_coord, const typename System::TileComponentIndices<N> &comps_per_tile);
+    //     // This is NOT called when splitting grids, so if you're touching something other than per-component data, do that in `FinalizeGridAfterChange`.
+    //     static void OnUpdateGridChunkComponents(WorldRef world, GridRef grid, vec2<typename System::WholeChunkCoord> chunk_coord, const typename System::TileComponentIndices<N> &comps_per_tile);
     //
     //     // When splitting a grid, this is called before moving a component from chunk to a chunk of a newly created entity.
     //     static void OnPreMoveComponentBetweenChunks(WorldRef world, GridRef source_grid, System::ComponentCoords coords, GridRef target_grid);
+    //     // Same, but called after moving the component.
+    //     static void OnPostMoveComponentBetweenChunks(WorldRef world, GridRef source_grid, System::ComponentCoords coords, GridRef target_grid);
     //
     //     // This is caleld to finalize a grid after it's updated, and AFTER the splitting if any.
     //     // This is NOT called for the grids created by `SplitGrid`
     //     static void FinalizeGridAfterChange(WorldRef world, GridRef grid);
+    //
+    //     // This is called on a chunk after grid split removes some components from it (once after all components).
+    //     static void FinalizeChunkAfterSplitRemovingComponents(WorldRef world, GridRef grid, vec2<typename System::WholeChunkCoord> chunk_coord);
+    //
+    //     // This is called after a chunk is updated after a change. After `OnUpdateGridChunkComponents` or `FinalizeChunkAfterSplitRemovingComponents`.
+    //     // You can get some redundant calls here, so don't do anything crazy expensive.
+    //     static void FinalizeChunkAfterChange(WorldRef world, GridRef grid, vec2<typename System::WholeChunkCoord> chunk_coord);
 
     template <typename System, typename HighLevelTraits>
     class DirtyChunkLists;
 
-    template <typename System, int N, typename CellType, typename PerComponentData = typename System::Empty>
+    template <typename System, int N, typename CellType, typename PerChunkData = typename Meta::Empty, typename PerComponentData = typename Meta::Empty>
     class ChunkGrid
     {
         template <typename System_, typename HighLevelTraits_>
@@ -123,6 +134,11 @@ namespace TileGrids
 
             ChunkDirtyFlags dirty_flags{};
 
+            // The bounding box for contents of this chunk (coordinates are relative to the chunk, measured in tiles).
+            rect2<typename System::CoordInsideChunk> content_bounds;
+
+            [[no_unique_address]] PerChunkData user_data{};
+
           public:
             Chunk() {}
 
@@ -131,10 +147,18 @@ namespace TileGrids
             // The connectivity components in this chunk.
             [[nodiscard]] const ChunkComponentsType &GetComponents() const {return components;}
 
-            // Expose the extra per-component data as mutable. Everything else is exposed as const only to prevent accidental modification without setting dirty flags.
-            [[nodiscard]] PerComponentData &GetMutComponentExtraData(typename System::ComponentIndex i)
+            // The bounding box for contents of this chunk (coordinates are relative to the chunk, measured in tiles).
+            [[nodiscard]] rect2<typename System::CoordInsideChunk> GetContentBounds() const {return content_bounds;}
+
+            // Returns the per-chunk user data.
+            auto GetUserData(this auto &&self) -> Meta::copy_cv<decltype(self), PerChunkData &> {return self.user_data;}
+
+            // Expose the per-component user data as mutable. If you tried to access it through `GetComponents()`,
+            // you would only get a const reference, because that (and the tiles themselves) are exposed as const only,
+            // to prevent accidental modification without setting tee dirty flags.
+            [[nodiscard]] PerComponentData &GetMutComponentUserData(typename System::ComponentIndex i)
             {
-                return components.components[std::to_underlying(i)].extra_data;
+                return components.components[std::to_underlying(i)].user_data;
             }
         };
 
@@ -414,6 +438,8 @@ namespace TileGrids
             // When splitting a grid, this accumulates all new chunk edges in each component, so we can update them.
             // `[0]` is vertical edges to the right of chunks, `[1]` is horizontal edges below a chunk.
             std::vector<vec2<typename System::WholeChunkCoord>> new_chunk_edges[2];
+            // This accumulates each chunk moved to a specific new grid.
+            std::vector<vec2<typename System::WholeChunkCoord>> new_chunks;
         };
 
         struct SplitSettings
@@ -463,6 +489,8 @@ namespace TileGrids
                     (*chunk)->components,
                     // Tile to component map.
                     &comps_per_tile,
+                    // Resulting bounding box.
+                    &(*chunk)->content_bounds,
                     // On component done.
                     nullptr,
                     // For each cell component.
@@ -494,14 +522,19 @@ namespace TileGrids
                 );
 
                 // Run the user callback. Even if there's no components, just in case.
-                HighLevelTraits::OnUpdateGridChunkContents(world, grid_ref, chunk_coord, std::as_const(comps_per_tile));
+                HighLevelTraits::OnUpdateGridChunkComponents(world, grid_ref, chunk_coord, std::as_const(comps_per_tile));
 
                 // Destroy the chunk if empty.
                 if ((*chunk)->components.components.empty())
                 {
                     *chunk = nullptr;
                     shrinker.AddEmptyChunk(chunk_coord);
+                    continue;
                 }
+
+                // Another callback. This one only if the chunk is not destroyed. Not entirely consistent, but this makes more sense to me?
+                // This call can also be redundant if the chunk gets split later, but it's hard to fix this.
+                HighLevelTraits::FinalizeChunkAfterChange(world, grid_ref, chunk_coord);
             }
 
             // Set dirty flags for the edges. See the comment on this whole function.
@@ -625,13 +658,18 @@ namespace TileGrids
 
                     reused.new_chunk_edges[0].clear();
                     reused.new_chunk_edges[1].clear();
+                    reused.new_chunks.clear();
 
                     for (auto coords : comp_to_emit.contents)
                     {
                         const auto &old_chunk = grid_data.chunks.at(coords.chunk_coord);
                         auto &new_chunk = new_grid_data.chunks.at(coords.chunk_coord);
+                        bool creating_new_chunk = false;
                         if (!new_chunk)
+                        {
                             new_chunk = std::make_unique<std::remove_cvref_t<decltype(*new_chunk)>>();
+                            creating_new_chunk = true;
+                        }
 
                         HighLevelTraits::OnPreMoveComponentBetweenChunks(world, grid_ref, std::as_const(coords), new_grid_ref);
 
@@ -648,6 +686,16 @@ namespace TileGrids
                             }()
                         );
 
+                        { // Update the combined bounds of all components.
+                            auto rect = new_chunk->components.components[std::to_underlying(coords.in_chunk_component)].component.GetBounds();
+                            if (creating_new_chunk)
+                                new_chunk->content_bounds = rect;
+                            else
+                                new_chunk->content_bounds = new_chunk->content_bounds.combine(rect);
+                        }
+
+                        HighLevelTraits::OnPostMoveComponentBetweenChunks(world, grid_ref, std::as_const(coords), new_grid_ref);
+
                         // For each of the 4 chunk edges, if there's no chunk there yet, add this edge to our own little dirty list.
                         for (int j = 0; j < 4; j++)
                         {
@@ -656,9 +704,12 @@ namespace TileGrids
                             if (!other_chunk)
                                 reused.new_chunk_edges[j % 2].push_back(j >= 2 ? other_chunk_coord : coords.chunk_coord);
                         }
+
+                        // Add a chunk to the dirty list.
+                        reused.new_chunks.push_back(coords.chunk_coord);
                     }
 
-                    // Update chunk boundaries.
+                    // Update chunk edges.
                     for (bool vertical : {false, true})
                     {
                         for (const auto chunk_coord_a : reused.new_chunk_edges[vertical])
@@ -670,6 +721,10 @@ namespace TileGrids
                             System::ComputeConnectivityBetweenChunks(reused.conn, chunk_a ? &chunk_a->components : nullptr, chunk_b ? &chunk_b->components : nullptr, vertical);
                         }
                     }
+
+                    // Run callbacks for the individual dirty chunks.
+                    for (auto chunk_coord : reused.new_chunks)
+                        HighLevelTraits::FinalizeChunkAfterChange(world, new_grid_ref, chunk_coord);
 
                     // Finalize the initialization of the new grid.
                     HighLevelTraits::FinishSplitGridInit(world, grid_ref, new_grid_ref);
@@ -690,14 +745,24 @@ namespace TileGrids
                     std::sort(chunk_comp_indices.begin(), chunk_comp_indices.end());
 
                     for (std::size_t i = chunk_comp_indices.size(); i-- > 0;)
-                    {
                         old_comps.SwapWithLastAndRemoveComponent(chunk_comp_indices[i], true);
-                        if (old_comps.components.empty())
-                        {
-                            old_chunk = nullptr;
-                            shrinker.AddEmptyChunk(chunk_coord);
-                        }
+
+                    if (old_comps.components.empty())
+                    {
+                        old_chunk = nullptr;
+                        shrinker.AddEmptyChunk(chunk_coord);
                     }
+                    else
+                    {
+                        // Compute the combined rect of all components.
+                        auto rect = old_comps.components.front().component.GetBounds();
+                        for (std::size_t i = 1 /*sic*/; i < old_comps.components.size(); i++)
+                            rect = rect.combine(old_comps.components[i].component.GetBounds());
+                        old_chunk->content_bounds = rect;
+                    }
+
+                    HighLevelTraits::FinalizeChunkAfterSplitRemovingComponents(world, grid_ref, chunk_coord);
+                    HighLevelTraits::FinalizeChunkAfterChange(world, grid_ref, chunk_coord);
                 }
 
                 // Finish shrinking the grid.

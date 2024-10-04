@@ -166,7 +166,7 @@ namespace TileGrids
         };
 
         // Information about a single connectivity component inside of a chunk.
-        template <typename ExtraData = Meta::Empty>
+        template <typename UserData = Meta::Empty>
         struct ComponentEntry
         {
             // The list of tiles.
@@ -176,7 +176,7 @@ namespace TileGrids
             std::vector<ComponentEdgeInfo> border_edges;
 
             // Extra per-component data. This usually stores physics colliders.
-            [[no_unique_address]] ExtraData extra_data{};
+            [[no_unique_address]] UserData user_data{};
         };
 
         // Information about what component touches a specific edge on a chunk boundary. Chunks store lists of those.
@@ -454,6 +454,8 @@ namespace TileGrids
                 Meta::same_as_any_of<ComponentsType, Component> auto &out,
                 // Optional. If specified, must point to a default-constructed object. Will write the component indices for each tile to it.
                 TileComponentIndices<N> *out_comp_indices,
+                // Optional. If specified, this receives the bounding box of all non-empty tiles in the chunk.
+                rect2<CoordInsideChunk> *out_bounds,
                 // Optional. Nullptr or `() -> void`. This is called after finishing writing each component to `out`.
                 // If `out` is a `Component` you must move it elsewhere in this callback, else it will get overwritten.
                 // If `out` is a `ComponentsType`, you don't have to do anything, as it can store multiple components.
@@ -481,6 +483,8 @@ namespace TileGrids
 
                 // Reset the target, whatever it is.
                 out = {};
+
+                bool first_tile = true;
 
                 for (const vec2<CoordInsideChunk> starting_pos : vector_range(vec2<CoordInsideChunk>(N)))
                 {
@@ -523,6 +527,14 @@ namespace TileGrids
                             out_comp.AddTile(pos_and_comp);
                             if (out_comp_indices)
                                 out_comp_indices->Set(pos_and_comp, this_comp_index);
+                            if (out_bounds)
+                            {
+                                if (first_tile)
+                                    *out_bounds = pos_and_comp.pos.tiny_rect();
+                                else
+                                    *out_bounds = out_bounds->combine(pos_and_comp.pos);
+                            }
+                            first_tile = false;
 
                             for (int i = 0; i < 4; i++)
                             {
