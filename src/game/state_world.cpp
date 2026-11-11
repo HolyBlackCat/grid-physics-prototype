@@ -36,7 +36,7 @@ struct PhysicsWorld : Tickable
 
     void Tick() override
     {
-        int n = 1;
+        int n = 4;
         for (int i = 0; i < n; i++)
             w.Step(1/60.f / n, 4);
 
@@ -54,6 +54,12 @@ enum class PhysicsMaskBits : std::uint64_t
     chunkContentBounds = 1 << 2, // Doesn't collide with anything, used to find chunks, e.g. for rendering.
 };
 
+// This is stored in userdata of bodies.
+struct PhysicsBodyInterface
+{
+    virtual ~PhysicsBodyInterface() = default;
+};
+
 namespace Tiles
 {
     struct SystemTraits : TileGrids::DefaultSystemTraits
@@ -66,6 +72,8 @@ namespace Tiles
     struct System : TileGrids::System<SystemTraits> {};
 
     static constexpr int chunk_size = 8;
+
+    static constexpr int tile_pixel_size = 32;
 
     // Each tile has this size in box2d coordinates.
     // Probably should be set to 1 in real
@@ -162,6 +170,7 @@ namespace Tiles
 
     struct ChunkData
     {
+        // A query hitbox for the non-empty part of the chunk.
         b2::Shape content_bounds;
     };
 
@@ -185,7 +194,7 @@ namespace Tiles
     using ChunkGrid = TileGrids::ChunkGrid<System, chunk_size, Cell, ChunkData, ChunkComponentData>;
 
     // The entity for tile grids.
-    struct GridEntity : Meta::with_virtual_destructor<GridEntity>
+    struct GridEntity : PhysicsBodyInterface
     {
         IMP_STANDALONE_COMPONENT(Game)
 
@@ -201,7 +210,13 @@ namespace Tiles
             body_params.automaticMass = false; // We update it in `FinalizeGridAfterChange()`.
 
             body = w.w.CreateBody(b2::OwningHandle, body_params);
+
+            body.SetUserData(static_cast<PhysicsBodyInterface *>(this));
         }
+
+        // Make this non-movable, a pointer to this is stored in userdata.
+        GridEntity(const GridEntity &) = delete;
+        GridEntity &operator=(const GridEntity &) = delete;
 
         void LoadTiles(Stream::ReadOnlyData data);
 
@@ -226,16 +241,17 @@ namespace Tiles
         return ret;
     }
 
-    [[nodiscard]] const b2::Shape::Params &GetShapeParamsChunkContentBounds()
+
+    using halfptr_t = std::conditional_t<sizeof(void *) == 4, std::int16_t, std::int32_t>;
+    using halfptr_vec2 = vec2<halfptr_t>;
+
+    [[nodiscard]] void *EncodeChunkCoordsIntoShapeUserData(vec2<System::WholeChunkCoord> chunk_coord)
     {
-        static const b2::Shape::Params ret = []{
-            b2::Shape::Params ret;
-            ret.density = 0;
-            ret.filter.categoryBits = std::to_underlying(PhysicsMaskBits::chunkContentBounds);
-            ret.filter.maskBits = std::to_underlying(PhysicsMaskBits::query);
-            return ret;
-        }();
-        return ret;
+        return std::bit_cast<void *>(chunk_coord.to<halfptr_t>());
+    }
+    [[nodiscard]] vec2<System::WholeChunkCoord> DecodeChunkCoordsFromShapeUserData(void *data)
+    {
+        return std::bit_cast<halfptr_vec2>(data).to<System::WholeChunkCoord>();
     }
 
     // Traits class for `tile_grids/high_level.h`. We wrap it in `EntityHighLevelTraits` below instead of using directly.
@@ -392,10 +408,10 @@ namespace Tiles
         {
             (void)controller;
 
+            // Update the content bounds collider.
+
             auto *chunk = grid->grid.GetChunk(chunk_coord);
 
-
-            // Update the content bounds collider.
             ASSERT(!chunk->GetComponents().components.empty());
             fvec2 chunk_base_offset = fvec2(chunk_coord) * chunk_size * physics_tile_size_multiplier;
 
@@ -405,7 +421,13 @@ namespace Tiles
             for (fvec2 corner : rect.to_contour())
                 hull.points[hull.count++] = corner;
 
-            chunk->GetUserData().content_bounds = grid->body.CreateShape(b2::OwningHandle, GetShapeParamsChunkContentBounds(), b2MakePolygon(&hull, 0));
+            b2::Shape::Params shape_params;
+            shape_params.density = 0;
+            shape_params.filter.categoryBits = std::to_underlying(PhysicsMaskBits::chunkContentBounds);
+            shape_params.filter.maskBits = std::to_underlying(PhysicsMaskBits::query);
+            shape_params.userData = EncodeChunkCoordsIntoShapeUserData(chunk_coord);
+
+            chunk->GetUserData().content_bounds = grid->body.CreateShape(b2::OwningHandle, shape_params, b2MakePolygon(&hull, 0));
         }
 
         // Each tile of a chunk stores this.
